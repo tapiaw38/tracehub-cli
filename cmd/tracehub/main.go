@@ -3,6 +3,9 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/tapiaw38/tracehub-cli/internal/client"
@@ -172,50 +175,73 @@ var streamCmd = &cobra.Command{
 		}
 
 		level, _ := cmd.Flags().GetString("level")
-		limit, _ := cmd.Flags().GetInt("limit")
+		interval, _ := cmd.Flags().GetInt("interval")
 
 		fmt.Printf("Streaming traces from project: %s\n", cfg.CurrentProject.Name)
-		fmt.Println("Press Ctrl+C to stop\n")
+		fmt.Println("Press Ctrl+C to stop")
+		fmt.Println()
+
+		if interval <= 0 {
+			interval = 2
+		}
 
 		filters := make(map[string]string)
 		if level != "" {
 			filters["level"] = level
 		}
-		if limit > 0 {
-			filters["limit"] = fmt.Sprintf("%d", limit)
-		}
+		filters["limit"] = "100"
 
-		// Query traces
-		response, err := apiClient.QueryTraces(cfg.CurrentProject.ID, filters)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to query traces: %v\n", err)
-			os.Exit(1)
-		}
+		lastTimestamp := time.Now()
 
-		if len(response.Traces) == 0 {
-			fmt.Println("No traces found.")
-			return
-		}
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-		// Display traces
-		for _, trace := range response.Traces {
-			levelColor := getLevelColor(trace.Level)
-			fmt.Printf("[%s] %s%-7s%s %s\n",
-				trace.Timestamp.Format("15:04:05"),
-				levelColor,
-				trace.Level,
-				"\033[0m",
-				trace.Message,
-			)
-			if trace.Source != "" {
-				fmt.Printf("          Source: %s\n", trace.Source)
+		ticker := time.NewTicker(time.Duration(interval) * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-sigChan:
+				fmt.Println("\n\nStreaming stopped.")
+				return
+			case <-ticker.C:
+				filtersCopy := make(map[string]string)
+				for k, v := range filters {
+					filtersCopy[k] = v
+				}
+				since := lastTimestamp.Add(time.Second).Format(time.RFC3339)
+				filtersCopy["since"] = since
+
+				response, err := apiClient.QueryTraces(cfg.CurrentProject.ID, filtersCopy)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to query traces: %v\n", err)
+					continue
+				}
+
+				if len(response.Traces) > 0 {
+					for _, trace := range response.Traces {
+						levelColor := getLevelColor(trace.Level)
+						fmt.Printf("[%s] %s%-7s%s %s\n",
+							trace.Timestamp.Format("15:04:05"),
+							levelColor,
+							trace.Level,
+							"\033[0m",
+							trace.Message,
+						)
+						if trace.Source != "" {
+							fmt.Printf("          Source: %s\n", trace.Source)
+						}
+						if trace.StackTrace != "" {
+							fmt.Printf("          Stack: %s\n", truncate(trace.StackTrace, 100))
+						}
+
+						if trace.Timestamp.After(lastTimestamp) {
+							lastTimestamp = trace.Timestamp
+						}
+					}
+				}
 			}
-			if trace.StackTrace != "" {
-				fmt.Printf("          Stack: %s\n", truncate(trace.StackTrace, 100))
-			}
 		}
-
-		fmt.Printf("\nShowing %d traces (use --limit to adjust)\n", len(response.Traces))
 	},
 }
 
@@ -278,7 +304,7 @@ func init() {
 	configureCmd.MarkFlagRequired("api-key")
 
 	streamCmd.Flags().String("level", "", "Filter by level (info, warn, error, fatal)")
-	streamCmd.Flags().Int("limit", 100, "Number of traces to display")
+	streamCmd.Flags().Int("interval", 2, "Polling interval in seconds (default: 2)")
 }
 
 func getLevelColor(level string) string {
